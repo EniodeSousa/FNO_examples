@@ -1,0 +1,280 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+import numpy as np
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+import matplotlib.pyplot as plt
+
+# Set seed for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# =====================================================================
+# 1. SYNTHETIC DATA GENERATOR (2D Darcy Flow Finite Difference Solver)
+# =====================================================================
+def solve_darcy_2d(a_grid):
+    """
+    Solves -div(a(x,y) * grad(u(x,y))) = 1 on domain (0,1)^2 with u = 0 on boundary.
+    Uses 2nd-order 5-point Finite Difference method on interior grid points.
+    """
+    N = a_grid.shape[0]
+    h = 1.0 / (N - 1)
+    n = N - 2  # Interior nodes count along each axis
+
+    a_int = a_grid[1:-1, 1:-1]
+
+    # Interface conductances (midpoint averages divided by h^2)
+    a_E = 0.5 * (a_int + a_grid[1:-1, 2:]) / (h**2)
+    a_W = 0.5 * (a_int + a_grid[1:-1, :-2]) / (h**2)
+    a_S = 0.5 * (a_int + a_grid[2:, 1:-1]) / (h**2)
+    a_N = 0.5 * (a_int + a_grid[:-2, 1:-1]) / (h**2)
+
+    a_C = a_E + a_W + a_S + a_N
+
+    # Build sparse 5-point Laplacian stencil
+    main_diag = a_C.ravel()
+
+    E_diag = -a_E.copy()
+    E_diag[:, -1] = 0.0  # Cut off horizontal connection at interior boundary
+    off_east = E_diag.ravel()[:-1]
+
+    W_diag = -a_W.copy()
+    W_diag[:, 0] = 0.0   # Cut off horizontal connection at interior boundary
+    off_west = W_diag.ravel()[1:]
+
+    off_south = -a_S.ravel()[:-n]
+    off_north = -a_N.ravel()[n:]
+
+    A = sp.diags([main_diag, off_east, off_west, off_south, off_north],
+                 [0, 1, -1, n, -n], format='csr')
+    f = np.ones(n * n)
+
+    # Solve sparse linear system A * u = f
+    u_int = spla.spsolve(A, f).reshape(n, n)
+
+    # Reconstruct full N x N solution field with zero boundary conditions
+    u = np.zeros((N, N))
+    u[1:-1, 1:-1] = u_int
+    return u
+
+
+def generate_darcy_data(num_samples=160, grid_size=64):
+    """
+    Generates dataset of random permeability fields a(x,y) and Darcy solution u(x,y).
+    """
+    a_list, u_list = [], []
+
+    # Frequency grid for 2D Gaussian Random Field (GRF)
+    k = torch.fft.fftfreq(grid_size) * grid_size
+    K1, K2 = torch.meshgrid(k, k, indexing='ij')
+    K_sq = K1**2 + K2**2
+    alpha, tau = 2.0, 3.0
+    spectrum = (K_sq + tau**2) ** (-alpha / 2)
+    spectrum[0, 0] = 0.0
+
+    for _ in range(num_samples):
+        # Generate GRF and threshold to binary values (3.0 and 12.0)
+        noise = torch.randn(grid_size, grid_size)
+        grf = torch.fft.ifft2(torch.fft.fft2(noise) * spectrum).real
+        a = torch.where(grf > 0, 12.0, 3.0).numpy()
+
+        # Solve PDE
+        u = solve_darcy_2d(a)
+
+        a_list.append(torch.tensor(a, dtype=torch.float32))
+        u_list.append(torch.tensor(u, dtype=torch.float32))
+
+    a_tensor = torch.stack(a_list) # Shape: (num_samples, grid_size, grid_size)
+    u_tensor = torch.stack(u_list) # Shape: (num_samples, grid_size, grid_size)
+
+    # Create 2D meshgrid coordinates [x, y]
+    x = torch.linspace(0, 1, grid_size)
+    y = torch.linspace(0, 1, grid_size)
+    grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
+    
+    grid = torch.stack((grid_x, grid_y), dim=-1).repeat(num_samples, 1, 1, 1)
+
+    # Concatenate inputs: [a(x,y), grid_x, grid_y] -> (num_samples, grid_size, grid_size, 3)
+    inputs = torch.cat((a_tensor.unsqueeze(-1), grid), dim=-1)
+    targets = u_tensor.unsqueeze(-1)                          # (num_samples, grid_size, grid_size, 1)
+
+    return inputs, targets
+
+
+print("Generating synthetic 2D Darcy Flow dataset...")
+inputs, targets = generate_darcy_data(num_samples=160, grid_size=64)
+
+# Train / Test split (128 train, 32 test)
+train_dataset = TensorDataset(inputs[:128], targets[:128])
+test_dataset = TensorDataset(inputs[128:], targets[128:])
+
+train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+print("Data generation complete!")
+
+
+# =====================================================================
+# 2. MODEL DEFINITION (FNO-2D)
+# =====================================================================
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, modes1: int, modes2: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes1 = modes1
+        self.modes2 = modes2
+
+        self.scale = 1 / (in_channels * out_channels)
+        self.weights1 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat)
+        )
+        self.weights2 = nn.Parameter(
+            self.scale * torch.rand(in_channels, out_channels, self.modes1, self.modes2, dtype=torch.cfloat)
+        )
+
+    def compl_mul2d(self, input_ft: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("bixy,ioxy->boxy", input_ft, weights)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batchsize = x.shape[0]
+        x_ft = torch.fft.rfft2(x)
+
+        out_ft = torch.zeros(
+            batchsize, self.out_channels, x.size(-2), x.size(-1) // 2 + 1,
+            dtype=torch.cfloat, device=x.device
+        )
+        out_ft[:, :, :self.modes1, :self.modes2] = self.compl_mul2d(
+            x_ft[:, :, :self.modes1, :self.modes2], self.weights1
+        )
+        out_ft[:, :, -self.modes1:, :self.modes2] = self.compl_mul2d(
+            x_ft[:, :, -self.modes1:, :self.modes2], self.weights2
+        )
+
+        x = torch.fft.irfft2(out_ft, s=(x.size(-2), x.size(-1)))
+        return x
+
+
+class FNO2d(nn.Module):
+    def __init__(self, modes1: int = 12, modes2: int = 12, width: int = 32, in_channels: int = 3):
+        super().__init__()
+        self.modes1 = modes1
+        self.modes2 = modes2
+        self.width = width
+
+        self.fc0 = nn.Linear(in_channels, self.width)
+
+        self.conv0 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+        self.conv1 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+        self.conv2 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+        self.conv3 = SpectralConv2d(self.width, self.width, self.modes1, self.modes2)
+
+        self.w0 = nn.Conv2d(self.width, self.width, 1)
+        self.w1 = nn.Conv2d(self.width, self.width, 1)
+        self.w2 = nn.Conv2d(self.width, self.width, 1)
+        self.w3 = nn.Conv2d(self.width, self.width, 1)
+
+        self.fc1 = nn.Linear(self.width, 128)
+        self.fc2 = nn.Linear(128, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc0(x)
+        x = x.permute(0, 3, 1, 2)
+
+        x = F.gelu(self.conv0(x) + self.w0(x))
+        x = F.gelu(self.conv1(x) + self.w1(x))
+        x = F.gelu(self.conv2(x) + self.w2(x))
+        x = F.gelu(self.conv3(x) + self.w3(x))
+
+        x = x.permute(0, 2, 3, 1)
+        x = F.gelu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+
+def relative_l2_loss(pred, target):
+    diff_norms = torch.norm(pred.reshape(pred.size(0), -1) - target.reshape(target.size(0), -1), p=2, dim=1)
+    target_norms = torch.norm(target.reshape(target.size(0), -1), p=2, dim=1)
+    return torch.mean(diff_norms / target_norms)
+
+
+# =====================================================================
+# 3. TRAINING LOOP
+# =====================================================================
+model = FNO2d(modes1=12, modes2=12, width=32, in_channels=3).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+
+epochs = 20
+print("\nStarting Training...")
+
+for epoch in range(1, epochs + 1):
+    model.train()
+    train_loss = 0.0
+    for x_batch, y_batch in train_loader:
+        x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+
+        optimizer.zero_grad()
+        out = model(x_batch)
+        loss = relative_l2_loss(out, y_batch)
+        loss.backward()
+        optimizer.step()
+
+        train_loss += loss.item() * x_batch.size(0)
+
+    scheduler.step()
+    train_loss /= len(train_loader.dataset)
+
+    if epoch % 5 == 0 or epoch == 1:
+        model.eval()
+        test_loss = 0.0
+        with torch.no_grad():
+            for x_batch, y_batch in test_loader:
+                x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+                out = model(x_batch)
+                test_loss += relative_l2_loss(out, y_batch).item() * x_batch.size(0)
+        test_loss /= len(test_loader.dataset)
+
+        print(f"Epoch {epoch:02d}/{epochs} | Train Loss: {train_loss:.4f} | Test Loss: {test_loss:.4f}")
+
+
+# =====================================================================
+# 4. VISUALIZATION OF RESULTS
+# =====================================================================
+model.eval()
+x_test, y_test = next(iter(test_loader))
+with torch.no_grad():
+    y_pred = model(x_test.to(device)).cpu()
+
+sample_idx = 0
+a_map = x_test[sample_idx, :, :, 0].numpy()
+u_true = y_test[sample_idx, :, :, 0].numpy()
+u_pred = y_pred[sample_idx, :, :, 0].numpy()
+error = np.abs(u_true - u_pred)
+
+fig, axes = plt.subplots(1, 4, figsize=(20, 4.5))
+
+im0 = axes[0].imshow(a_map, cmap='viridis')
+axes[0].set_title("Input Permeability a(x,y)")
+fig.colorbar(im0, ax=axes[0])
+
+im1 = axes[1].imshow(u_true, cmap='plasma')
+axes[1].set_title("Ground Truth u(x,y)")
+fig.colorbar(im1, ax=axes[1])
+
+im2 = axes[2].imshow(u_pred, cmap='plasma')
+axes[2].set_title("FNO2d Prediction u_hat(x,y)")
+fig.colorbar(im2, ax=axes[2])
+
+im3 = axes[3].imshow(error, cmap='magma')
+axes[3].set_title("Absolute Error |u - u_hat|")
+fig.colorbar(im3, ax=axes[3])
+
+for ax in axes:
+    ax.axis('off')
+
+plt.tight_layout()
+plt.show()
